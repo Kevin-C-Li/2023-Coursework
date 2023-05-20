@@ -1,0 +1,391 @@
+---
+title: "COVID-19 in Toronto"
+author: "Kevin Li"
+date: "3/29/2023"
+header-includes:
+  - \usepackage{amsmath, amsfonts, amssymb}
+  - \usepackage{hyperref}
+output: pdf_document
+fig_width: 3
+fig_height: 2
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width = 6, fig.height = 4)
+library(tidyverse, warn.conflicts = FALSE)
+library(lubridate, warn.conflicts = FALSE)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2, warn.conflicts = FALSE)
+library(rattle, warn.conflicts = FALSE)
+library(rpart, warn.conflicts = FALSE)
+data <- read_csv("COVID19 cases.csv")
+```
+
+```{=tex}
+\flushleft
+\section{Abstract}
+```
+This report aims to establish a relationship between COVID-19 cases in
+Toronto based on data released by the City of Toronto and fatalities,
+and will attempt to fit a classifier to determine chance of survival for
+a given case. The features that will be analyzed are:
+
+```{=tex}
+\begin{itemize}
+  \item Age, which is split by decade starting from $\leq 19$ to $\geq 90$
+  \item Neighborhood, geographically divided into 140 distinct regions
+  \begin{itemize}
+    \item Additionally, average income and population by neighbourhood was 
+    considered when modeling a relationship - this data 
+    was extracted from a different dataset, which can be found here:                            
+    \url{https://open.toronto.ca/dataset/neighbourhood-profiles/}
+  \end{itemize}
+  \item Full Street Address: The first 3 characters of the postal code
+  \item Infection source: either travel, household contact close contact, outbreak, 
+        or community (none of the former sources)
+  \item Classification: either confirmed or probable
+  \item Gender
+  \item If the patient was ever hospitalized, in ICU, Intubated
+  \item Outcome, the feature to be classified - either active, resolved or fatal
+\end{itemize}
+```
+The data was compiled by Toronto Public Health in response to the
+COVID-19 pandemic and released under the Open Government License,
+available here:
+\url{https://open.toronto.ca/dataset/covid-19-cases-in-toronto/}
+\newpage
+\section{Observations}
+
+Breakdown of cases by year:
+
+```{r echo=FALSE, warning=FALSE}
+data <- subset(data, select=-c(`Outbreak Associated`))
+rows = nrow(data)
+data <- data %>% mutate(`Client Gender` = ifelse(
+  `Client Gender` %in% c('NON-BINARY', 'TRANS MAN', 
+                         'TRANS WOMAN', 'TRANSGENDER', 'UNKNOWN', 
+                         'NOT LISTED, PLEASE SPECIFY'), 'OTHER', `Client Gender`))
+data <- data %>% mutate(`Source of Infection` = ifelse(
+  `Source of Infection` %in% c('Pending'), 'No Information', `Source of Infection`))
+data <- data %>% mutate(`Source of Infection` = ifelse(
+  `Source of Infection` %in% c('Outbreaks, Congregate Settings',
+                               'Outbreaks, Healthcare Institutions', 
+                               'Outbreaks, Other Settings'), 
+  'Outbreak', `Source of Infection`))
+data <- data %>% mutate(`Ever Hospitalized` = (`Ever Hospitalized`=="Yes")) %>%
+  mutate(`Ever in ICU` = (`Ever in ICU`=="Yes")) %>%
+  mutate(`Ever Intubated` = (`Ever Intubated`=="Yes"))
+data_table <- data %>% group_by(Year=floor_date(`Reported Date`, "year")) %>% 
+  mutate(Year = format(Year, "%Y"))
+ggplot(data_table, aes(x=Year, fill=`Client Gender`)) + geom_bar(position = "stack") +
+  scale_fill_manual(values=c('coral4','steelblue','violet')) + 
+  labs(title = "Cases by Gender", y="Total Cases")
+ggplot(data_table, aes(x=Year, fill=Outcome)) + geom_bar(position = "fill") +
+  scale_fill_manual(values=c('cyan4','rosybrown','greenyellow')) + 
+  labs(title = "Cases by Outcome", y="Proportion of Cases")
+```
+
+Total fatalities: 4821 (1.22% of cases) \newpage  Rate of patients
+admitted to Hospital/ICU/Intubation:
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+patients_hosp <- data %>% group_by(`Ever Hospitalized`, 
+                                   `Ever in ICU`, `Ever Intubated`) %>%
+  summarize(N = n(), Proportion=n()/rows)
+patients_hosp
+```
+
+Patients by source of infection:
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+patients_source <- data %>% group_by(`Source of Infection`) %>%
+  summarize(N = n(), Proportion=n()/rows)
+patients_source
+```
+
+Average age of infection: since the ages of patients are released by age
+range, calculating the average age of infection can be done using a
+confidence interval. A random sample of size 1000 will be taken from the
+dataset to reduce the running time of the bootstrap function. Assuming
+that patients within a certain age range (ex. 50-59 years) are
+distributed uniformly, i.e. $X_{a-b} \sim Uniform(a, b)$, a random age
+will be assigned to each patient accordingly using \verb+runif+. For the
+age range of 90+ years, an exponential distribution will be used
+instead($X_{90+} \sim exp(1) + 90$). A bootstrap confidence interval can
+then be established using the random ages, which will accurately
+represent the true random age.\
+Mean age of patient:
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+age <- sample_n(subset(data, select=c(`Age Group`)), 1000)
+age <- na.omit(age)
+rand_age = function(name){
+  if(str_equal(name[1], '19 and younger')){
+    return(runif(1, min=0, max=19)[1])
+  }
+  if(str_equal(name[1], '90 and older')){
+    return(rexp(1)[1]+90.0)
+  }
+  a = as.numeric(substr(name[1], 1, 2))[1]
+  b = as.numeric(substr(name[1], 7, 8))[1]
+  return(runif(1, min=a, max=b))
+}
+random_age <- apply(age, 1, rand_age)
+boot = function(){
+  boot_sam = sample(random_age, size=1000, replace=TRUE)
+  return(mean(boot_sam))
+}
+boot_mean <- replicate(1000, boot())
+quantile(boot_mean, c(0.025, 0.975))
+```
+
+\newpage
+
+The relationship between income and number of cases can be determined by
+fitting a linear model between the average income by neighbourhood and
+the proportion of cases to total population.\
+The test hypothesis of the linear model is:
+$H_0: Income \perp \frac{cases}{population}$\
+while the alternative hypothesis is:
+$H_a: Income \not\perp \frac{cases}{population}$
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+data_neighbour <- data %>% group_by(`Neighbourhood Name`) %>% 
+  summarize(N = n()) %>% head(n=140)
+
+neighbour_prof <- read_csv("neighbourhood-profiles-2016-140-model.csv")
+average_income <- neighbour_prof[945,] %>% t() %>% 
+  tail(n=140)
+average_income_thousands <- as.numeric(gsub(",", "", average_income))/1000
+total_pop <- neighbour_prof[3,] %>% t() %>% tail(n=140)
+total_pop <- as.numeric(gsub(",", "", total_pop))
+data_neighbour <- data_neighbour %>% mutate(Prop_cases_pop = N/total_pop*100)
+lin_model <- lm(data_neighbour$Prop_cases_pop~average_income_thousands)
+summary(lin_model)
+plot(average_income_thousands, data_neighbour$Prop_cases_pop, col="blue", pch=1, cex=0.5, 
+     main="Wealth Inequality and COVID-19 in Toronto", cex.main=0.8, 
+     xlab="Average income per Thousand", 
+     ylab="% of Cases Relative to Total Population", cex.lab=0.8)
+abline(lin_model)
+```
+
+The intercept coefficient of 15 implies that when average income is 0,
+the proportion of cases to neighbourhood population is 15%. The
+average_income coefficient of -0.07 reveals that the rate of cases drops
+by 7% per \$1000 in additional average income.\
+A p-value of 0.159 and R-squared value of 0.014 imply that the
+correlation between average income and rate of cases by neighbourhood is
+extremely weak. There is insufficient evidence to reject the null
+hypothesis of income being unrelated to the probability of contracting
+COVID-19. \newpage Similarly, the relationship between average income
+and chance of fatality per case can be fitted with a linear model using
+the following hypotheses:
+$H_0: Income \perp \frac{Fatalities}{Total Cases}$\
+$H_a: Income \not\perp \frac{Fatalities}{Total Cases}$
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+data_neighbour_fatal <- data  %>% filter(str_equal(`Outcome`, "FATAL")) %>% 
+  group_by(`Neighbourhood Name`) %>% summarize(N = n()) %>% head(n=140)
+data_neighbour_fatal <- data_neighbour_fatal$N/data_neighbour$N * 100
+lin_model_fatal <- lm(data_neighbour_fatal~average_income_thousands)
+summary(lin_model_fatal)
+plot(average_income_thousands, data_neighbour_fatal, col="red", pch=1, cex=0.5, 
+     main="Wealth Inequality and COVID-19 Fatalities in Toronto", cex.main=0.8, 
+     xlab="Average income per Thousand", 
+     ylab="% of Fatal Cases Relative to Total Cases", cex.lab=0.8)
+abline(lin_model_fatal)
+```
+
+An intercept coefficient of 1.32 implies that when the average income is
+\$0, the fatality of cases is approximately 1.32%. The
+average_income_thousands coefficient of -0.006 implies that the
+lethality of COVID-19 drops by around 0.6% per additional thousand
+dollars of average income.\
+The correlation is even lower than before, signalling that there is
+almost no relationship between fatality rate and average income of the
+patient. Likewise, a p-value of almost 0.5 does not provide sufficient
+evidence to reject the null hypothesis of fatality rate being unrelated
+to income. 
+\newpage
+Finally, a 4-fold cross validation technique will be 
+implemented to develop a classifier. The features used for the classifier will
+be:
+\begin{itemize}
+  \item Age Group
+  \item Source of Infection
+  \item Client Gender
+  \item Ever Hospitalized/in ICU/Intubated
+\end{itemize}
+It is likely that source of infection and gender may become statistically irrelevant
+as the information gained from these features is very small. 
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+data <- data %>% mutate(`Outcome` = ifelse(str_equal(`Outcome`, "FATAL"), "Fatal", "Not fatal")) %>%
+  mutate(group_ind = sample(c(1,2,3,4), size=nrow(data), replace=T)) %>% na.omit()
+names(data) <- make.names(names(data))
+accuracy_vec <- vector()
+for(i in 1:4){
+  data_train <- data %>% filter(group_ind != i)
+  Dec_tree <- rpart(`Outcome` ~ `Age.Group` + 
+                    `Source.of.Infection` + `Client.Gender` + 
+                    `Ever.Hospitalized` + `Ever.in.ICU` + `Ever.Intubated`,  
+                    data=data_train, method = "class")
+  data_test <- data %>% filter(group_ind == i)
+  result <- predict(Dec_tree, data_test, type="class")
+  conf_mat <- table(result, data_test$`Outcome`)
+  accuracy_vec[i] <- sum(diag(conf_mat))/sum(conf_mat)
+  if(i == 1){
+    fancyRpartPlot(Dec_tree)
+  }
+}
+print("4-fold cross-validation results: ")
+print(accuracy_vec)
+print("Accuracy of decision tree classifier: ")
+print(mean(accuracy_vec))
+```
+
+\newpage
+\section{Conclusion}  
+COVID-19 has had detrimental effects in the city of Toronto. While the overall
+fatality rate of the disease is lower than its predecessor SARS, its overwhelming
+prevalence has resulted in many more deaths. COVID is mostly benign, since
+under 5% of confirmed or suspected infections require hospitalization. The number
+of infections between women and men was approximately equal in 2020 and 2021, but more
+women were infected than men in 2022. The mean age of infection in Toronto is likely 
+somewhere between 40 and 43, and a weak negative
+correlation between average income and total cases could be found - but there was
+no evidence to suggest fatalities were linked to income. Finally, decision tree
+analysis reveals that intubated patients over the age of 60 are more likely
+to die, while intubated patients under the age of 60 were more likely to survive. 
+
+\newpage
+
+```{r eval=FALSE, warning=FALSE, message=FALSE}
+# Initial setup
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width = 6, fig.height = 4)
+library(tidyverse, warn.conflicts = FALSE)
+library(lubridate, warn.conflicts = FALSE)
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2, warn.conflicts = FALSE)
+library(rattle, warn.conflicts = FALSE)
+library(rpart, warn.conflicts = FALSE)
+data <- read_csv("COVID19 cases.csv")
+
+# Basic information (Client cases by Gender/Outcome)
+data <- subset(data, select=-c(`Outbreak Associated`))
+rows = nrow(data)
+data <- data %>% mutate(`Client Gender` = ifelse(
+  `Client Gender` %in% c('NON-BINARY', 'TRANS MAN', 
+                         'TRANS WOMAN', 'TRANSGENDER', 'UNKNOWN', 
+                         'NOT LISTED, PLEASE SPECIFY'), 'OTHER', `Client Gender`))
+data <- data %>% mutate(`Source of Infection` = ifelse(
+  `Source of Infection` %in% c('Pending'), 'No Information', `Source of Infection`))
+data <- data %>% mutate(`Source of Infection` = ifelse(
+  `Source of Infection` %in% c('Outbreaks, Congregate Settings',
+                               'Outbreaks, Healthcare Institutions', 
+                               'Outbreaks, Other Settings'), 
+  'Outbreak', `Source of Infection`))
+data <- data %>% mutate(`Ever Hospitalized` = (`Ever Hospitalized`=="Yes")) %>%
+  mutate(`Ever in ICU` = (`Ever in ICU`=="Yes")) %>%
+  mutate(`Ever Intubated` = (`Ever Intubated`=="Yes"))
+data_table <- data %>% group_by(Year=floor_date(`Reported Date`, "year")) %>% 
+  mutate(Year = format(Year, "%Y"))
+ggplot(data_table, aes(x=Year, fill=`Client Gender`)) + geom_bar(position = "stack") +
+  scale_fill_manual(values=c('coral4','steelblue','violet')) + 
+  labs(title = "Cases by Gender", y="Total Cases")
+ggplot(data_table, aes(x=Year, fill=Outcome)) + geom_bar(position = "fill") +
+  scale_fill_manual(values=c('cyan4','rosybrown','greenyellow')) + 
+  labs(title = "Cases by Outcome", y="Proportion of Cases")
+
+# Rate of Hospitalization
+patients_hosp <- data %>% group_by(`Ever Hospitalized`, 
+                                   `Ever in ICU`, `Ever Intubated`) %>%
+  summarize(N = n(), Proportion=n()/rows)
+patients_hosp
+
+# Source of transmission
+patients_source <- data %>% group_by(`Source of Infection`) %>%
+  summarize(N = n(), Proportion=n()/rows)
+patients_source
+
+# Mean age
+age <- sample_n(subset(data, select=c(`Age Group`)), 1000)
+age <- na.omit(age)
+rand_age = function(name){
+  if(str_equal(name[1], '19 and younger')){
+    return(runif(1, min=0, max=19)[1])
+  }
+  if(str_equal(name[1], '90 and older')){
+    return(rexp(1)[1]+90.0)
+  }
+  a = as.numeric(substr(name[1], 1, 2))[1]
+  b = as.numeric(substr(name[1], 7, 8))[1]
+  return(runif(1, min=a, max=b))
+}
+random_age <- apply(age, 1, rand_age)
+boot = function(){
+  boot_sam = sample(random_age, size=1000, replace=TRUE)
+  return(mean(boot_sam))
+}
+boot_mean <- replicate(1000, boot())
+quantile(boot_mean, c(0.025, 0.975))
+
+# Regression: average income and COVID-19 cases 
+data_neighbour <- data %>% group_by(`Neighbourhood Name`) %>% 
+  summarize(N = n()) %>% head(n=140)
+
+neighbour_prof <- read_csv("neighbourhood-profiles-2016-140-model.csv")
+average_income <- neighbour_prof[945,] %>% t() %>% 
+  tail(n=140)
+average_income_thousands <- as.numeric(gsub(",", "", average_income))/1000
+total_pop <- neighbour_prof[3,] %>% t() %>% tail(n=140)
+total_pop <- as.numeric(gsub(",", "", total_pop))
+data_neighbour <- data_neighbour %>% mutate(Prop_cases_pop = N/total_pop*100)
+lin_model <- lm(data_neighbour$Prop_cases_pop~average_income_thousands)
+summary(lin_model)
+plot(average_income_thousands, data_neighbour$Prop_cases_pop, col="blue", pch=1, cex=0.5, 
+     main="Wealth Inequality and COVID-19 in Toronto", cex.main=0.8, 
+     xlab="Average income per Thousand", 
+     ylab="% of Cases Relative to Total Population", cex.lab=0.8)
+abline(lin_model)
+
+# Regression: average income and fatal cases
+data_neighbour_fatal <- data  %>% filter(str_equal(`Outcome`, "FATAL")) %>% 
+  group_by(`Neighbourhood Name`) %>% summarize(N = n()) %>% head(n=140)
+data_neighbour_fatal <- data_neighbour_fatal$N/data_neighbour$N * 100
+lin_model_fatal <- lm(data_neighbour_fatal~average_income_thousands)
+summary(lin_model_fatal)
+plot(average_income_thousands, data_neighbour_fatal, col="red", pch=1, cex=0.5, 
+     main="Wealth Inequality and COVID-19 Fatalities in Toronto", cex.main=0.8, 
+     xlab="Average income per Thousand", 
+     ylab="% of Fatal Cases Relative to Total Cases", cex.lab=0.8)
+abline(lin_model_fatal)
+
+# Classifier: Fatal cases
+data <- data %>% mutate(`Outcome` = ifelse(str_equal(`Outcome`, "FATAL"), "Fatal", "Not fatal")) %>%
+  mutate(group_ind = sample(c(1,2,3,4), size=nrow(data), replace=T)) %>% na.omit()
+names(data) <- make.names(names(data))
+accuracy_vec <- vector()
+for(i in 1:4){
+  data_train <- data %>% filter(group_ind != i)
+  Dec_tree <- rpart(`Outcome` ~ `Age.Group` + 
+                    `Source.of.Infection` + `Client.Gender` + 
+                    `Ever.Hospitalized` + `Ever.in.ICU` + `Ever.Intubated`,  
+                    data=data_train, method = "class")
+  data_test <- data %>% filter(group_ind == i)
+  result <- predict(Dec_tree, data_test, type="class")
+  conf_mat <- table(result, data_test$`Outcome`)
+  accuracy_vec[i] <- sum(diag(conf_mat))/sum(conf_mat)
+  if(i == 1){
+    fancyRpartPlot(Dec_tree)
+  }
+}
+print("4-fold cross-validation results: ")
+print(accuracy_vec)
+print("Accuracy of decision tree classifier: ")
+print(mean(accuracy_vec))
+```
